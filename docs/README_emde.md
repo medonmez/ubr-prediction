@@ -1,66 +1,204 @@
- Bank EMDE Session Sketch Generator
+# Bank EMDE Session Sketch Generator
 
-Bu doküman, Cleora embedding'lerinden zaman ağırlıklı ve yoğunluk tabanlı (density-based) müşteri temsilleri (sketches) üreten `bank_emde_session.py` scriptini açıklar.
-
-  Amaç
-Ham olay (event) vektörlerini, bir müşterinin tüm geçmişini özetleyen sabit boyutlu (-dim) tek bir vektöre dönüştürmektir. Bu vektör, Foundation Model'in girdisi olacaktır.
+Bu doküman, Cleora embedding'lerinden zaman ağırlıklı ve yoğunluk tabanlı müşteri temsilleri (sketches) üreten `bank_emde_session.py` scriptini detaylı olarak açıklar.
 
 ---
 
-  Hızlı Başlangıç
+## Amaç
+
+Ham olay (event) vektörlerini, bir müşterinin tüm geçmişini özetleyen **sabit boyutlu** tek bir vektöre dönüştürmektir.
+
+> [!IMPORTANT]
+> EMDE, klasik "ortalama alma" (mean pooling) yönteminden farklı olarak müşterinin **davranış uzayındaki dağılımını** saklar. Bu sayede benzer davranış örüntüleri gösteren müşteriler embedding uzayında yakın konumlanır.
+
+---
+
+## Hızlı Başlangıç
 
 ```bash
- Sanal ortamı aktif et
 source venv/bin/activate
-
- Sketch üretimini başlat
 python bank_emde_session.py
 ```
 
-İşlem - dakika sürebilir. Cleora embedding'lerinin (`data/embeddings/`) önceden üretilmiş olması gerekir.
+---
+
+## DLSH Algoritması (Density-dependent LSH)
+
+Mevcut implementasyon **DLSH** (Density-dependent Locality Sensitive Hashing) kullanır. Klasik LSH'den farkı, bucket sınırlarının verinin dağılımından **öğrenilmesidir**.
+
+### Klasik LSH vs DLSH
+
+| Özellik | Klasik LSH | DLSH |
+|---------|------------|------|
+| Bucket Sınırları | Random bias | **Quantile-based** |
+| Boş Bucket | Olabilir | **Garanti yok** |
+| Veri Dağılımı | Göz ardı | **Dikkate alınır** |
+| Fit Gereksinimi | Yok | **Var** |
+
+### DLSH Akışı
+
+```mermaid
+flowchart LR
+    A[Cleora\nEmbeddings\n1024-dim] --> B[Random\nProjection\n10 subspace]
+    B --> C[Quantile\nFit]
+    C --> D[Bucket\nAssignment\n32 bins]
+    D --> E[Weighted\nHistogram]
+    E --> F[Sparse\nSketch\n320-dim]
+```
 
 ---
 
-  Algoritma ve Mantık
+## DLSH Detaylı Açıklama
 
-EMDE (Efficient Manifold Density Estimator), klasik "ortalama alma" (mean pooling) yönteminden çok daha gelişmiş bir yöntemdir. Müşterinin davranış uzayındaki dağılımını saklar.
+### Adım 1: Random Projection
 
- . Parametreler (Neden  Boyut?)
-- N =  (Subspaces): Vektör uzayı rastgele  alt uzaya bölünür.
-- K =  (Bins): Her alt uzay $^ = $ parçaya bölünür.
-- Sonuç: $ \times  = $ boyutlu bir sparse vektör.
+Her subspace için tek bir rastgele projeksiyon vektörü oluşturulur:
 
- . Zaman Çürümesi (Time Decay)
-Müşteri davranışı zamanla değişir. Geçmiş olayların etkisi, bugüne yaklaştıkça artmalı, eskidikçe azalmalıdır.
-Formül: $Weight = e^{-\lambda \times \text{gün}}$
-- Lambda: . (Yaklaşık . alpha'ya denk gelir)
-- Etki:  gün önceki bir işlem %, dünkü işlem % etkiye sahiptir.
+```python
+self.projections = []
+for i in range(num_subspaces):  # 10 subspace
+    r = np.random.randn(embed_dim)  # 1024-dim
+    r = r / np.linalg.norm(r)  # Unit vector
+    self.projections.append(r)
+```
 
- . Past/Future Ayrımı (Self-Supervised Learning için)
-Modeli eğitmek için veriyi zamana göre böleriz:
-- Past UBR (Girdi): İlk - gün. Model bunu görüp geleceği tahmin etmeye çalışır.
-- Future UBR (Hedef): Son - gün. Modelin tahmin etmesi gereken "gelecek davranışı"dır.
+### Adım 2: Quantile Fit (Eğitim)
+
+Tüm embedding'ler projekte edilir ve bucket sınırları **quantile fonksiyonundan** öğrenilir:
+
+```python
+def fit(self, embeddings: np.ndarray):
+    quantile_percentages = np.linspace(0, 1, self.num_bins + 1)[1:-1]  # 31 sınır
+    
+    self.quantile_boundaries = []
+    for i in range(self.num_subspaces):
+        projected = embeddings @ self.projections[i]  # 1D projection
+        boundaries = np.quantile(projected, quantile_percentages)
+        self.quantile_boundaries.append(boundaries)
+```
+
+
+### Adım 3: Bucket Assignment
+
+Yeni bir embedding için bucket indeksi, öğrenilmiş sınırlara göre belirlenir:
+
+```python
+def _compute_bucket(self, embeddings, subspace_idx):
+    projected = embeddings @ self.projections[subspace_idx]
+    boundaries = self.quantile_boundaries[subspace_idx]
+    bucket_indices = np.searchsorted(boundaries, projected)
+    return bucket_indices
+```
+
+### Adım 4: Weighted Sketch
+
+Her embedding, time-decay ağırlığıyla bucket'lara katkı yapar:
+
+```python
+def create_weighted_sketch(self, embeddings, weights):
+    sketch = np.zeros(self.sketch_dim)  # 10 × 32 = 320
+    
+    for i in range(self.num_subspaces):
+        bucket_indices = self._compute_bucket(embeddings, i)
+        for j, bucket in enumerate(bucket_indices):
+            sketch_idx = i * self.num_bins + bucket
+            sketch[sketch_idx] += weights[j]
+    
+    # L1 Normalize
+    sketch = sketch / weights.sum()
+    return sketch
+```
 
 ---
 
-  Çıktılar
+## Konfigürasyon
 
-Script, `data/emde/` klasörüne `.npz` formatında şu matrisleri kaydeder:
+| Parametre | Değer | Açıklama |
+|-----------|-------|----------|
+| **NUM_SUBSPACES** | 10 | Bağımsız projeksiyon sayısı |
+| **NUM_BINS** | 32 | Her subspace'teki bucket sayısı |
+| **Sketch Boyutu** | 320 | 10 × 32 = 320 dim ||
 
-| Değişken Adı | Boyut | Açıklama |
-|--------------|-------|----------|
-| `past_sketches` | (, ) | Müşterinin ilk  günlük davranışı (Input) |
-| `future_sketches` | (, ) | Müşterinin son  günlük davranışı (Target) |
-| `portfolio_sketches`| (, ) | Müşterinin sahip olduğu ürünlerin özeti (Static Input) |
-| `churn_labels` | (,) | Churn durumu ( veya ) |
+### Neden Bu Değerler?
 
-Bu dosyalar `future_ubr_ffn.py` (Foundation Model) ve `churn_prediction_finetune.py` (Churn Model) tarafından kullanılır.
+- **10 Subspace**: Yeterli stabilite
+- **32 Bin**: Bu veri için makaledekinden daha az bin yeterli
+
 
 ---
 
-  Görselleştirmeler
+## Time Decay (Zaman Ağırlığı)
 
-Script ayrıca `data/emde/` içinde t-SNE grafikleri (`emde_session_tsne_walk...png`) oluşturur. Bu grafiklerde:
-.  Past UBR: Müşterilerin geçmiş davranışlarına göre nasıl kümelendiği.
-.  Future UBR: Gelecekteki davranışların (tahmin hedefinin) nasıl dağıldığı 
-görülebilir.
+Yakın zamandaki olaylar daha önemlidir:
+
+$$Weight = e^{-\lambda \times days\_ago}$$
+
+| Gün Önce | Ağırlık (λ=0.02) |
+|----------|------------------|
+| 0 (bugün) | 100% |
+| 10 | 81.9% |
+| 25 | 60.7% |
+
+---
+
+## Past/Future UBR Ayrımı
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                      30 Günlük Pencere                       │
+├─────────────────────────────────────────┬───────────────────┤
+│           PAST UBR (0-25 gün)           │ FUTURE UBR (25-30)│
+│              Girdi (Input)              │   Hedef (Target)  │
+│           Time-Decay Ağırlığı           │  Uniform Ağırlık  │
+└─────────────────────────────────────────┴───────────────────┘
+```
+
+---
+
+## Sketch Türleri
+
+| Sketch | Kaynak | Ağırlık | Kullanım |
+|--------|--------|---------|----------|
+| **Past** | 0-25 gün event | Time-decay | FFN input |
+| **Future** | 25-30 gün event | Uniform | FFN target |
+| **Portfolio** | Sahip olunan ürünler | Uniform | FFN input |
+
+---
+
+## Çıktılar
+
+`data/emde/emde_session_sketches_walkX.npz`:
+
+| Değişken | Boyut | Açıklama |
+|----------|-------|----------|
+| `past_sketches` | (10000, 320) | Model girdisi |
+| `future_sketches` | (10000, 320) | Model hedefi |
+| `portfolio_sketches` | (10000, 320) | Statik ürün bilgisi |
+| `churn_labels` | (10000,) | Churn durumu |
+| `segments` | (10000,) | Müşteri segmenti |
+
+---
+
+## Performans Sonuçları
+
+DLSH ile elde edilen sonuçlar:
+
+| Metrik | Klasik LSH | DLSH |
+|--------|------------|------|
+| **Sparsity** | 96.9% | **67.5%** |
+| **Churn ROC-AUC** | 0.50 | **0.9995** |
+| **Churn F1** | 0.21 | **0.986** |
+
+---
+
+## Önemli Notlar
+
+> [!NOTE]
+> **Neden Müşteri Embedding'leri Kullanılmıyor?**
+> 
+> Cleora'dan gelen müşteri embedding'leri (`C_xxxx`) kullanılmaz. Sadece event ve product embedding'leri kullanılır. Amaç müşterinin **davranışlarından** temsil oluşturmaktır.
+
+> [!NOTE]
+> **DLSH Fit Gereksinimi**
+> 
+> DLSH kullanmadan önce `fit()` metodu çağrılmalıdır. Bu, product/event embedding'lerinin dağılımından quantile sınırlarını öğrenir.

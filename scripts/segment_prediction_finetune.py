@@ -1,4 +1,19 @@
 #!/usr/bin/env python3
+"""
+Segment Prediction Model (Fine-Tuning)
+======================================
+Predicts customer segment (mass, affluent, business, private) using
+pre-trained Monad-EMDE Foundation Model backbone.
+
+Architecture:
+    Foundation Model Backbone → Classification Head → 4-class Softmax
+
+This is a multi-class classification task with imbalanced classes.
+Uses weighted CrossEntropyLoss to handle class imbalance.
+
+Author: Generated for TEB-ARF Project
+Date: 2024
+"""
 
 import os
 import numpy as np
@@ -9,15 +24,21 @@ import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader, random_split
 import matplotlib.pyplot as plt
 from sklearn.metrics import (
-    accuracy_score, precision_score, recall_score, f1_score, 
-    roc_auc_score, confusion_matrix, classification_report
+    accuracy_score, precision_score, recall_score, f1_score,
+    confusion_matrix, classification_report, roc_auc_score
 )
+from sklearn.preprocessing import label_binarize
+import seaborn as sns
 
 # Configuration
 DATA_DIR = "../data/emde"
 FOUNDATION_MODEL_DIR = "../data/ffn_model"
-OUTPUT_DIR = "../data/churn_model"
+OUTPUT_DIR = "../data/segment_model"
 WALK = 4  # Using walk4 with DLSH
+
+# Segment mapping
+SEGMENT_CLASSES = ['mass', 'affluent', 'business', 'private']
+NUM_CLASSES = len(SEGMENT_CLASSES)
 
 # Fine-tuning Configuration
 FREEZE_BACKBONE = False
@@ -36,12 +57,15 @@ torch.manual_seed(SEED)
 np.random.seed(SEED)
 
 
-class ChurnDataset(Dataset):
-    """Dataset for churn prediction task."""
+class SegmentDataset(Dataset):
+    """Dataset for segment prediction task."""
     
-    def __init__(self, past_sketches, portfolio_sketches, churn_labels):
+    def __init__(self, past_sketches, portfolio_sketches, segment_labels):
         self.X = np.concatenate([past_sketches, portfolio_sketches], axis=1).astype(np.float32)
-        self.y = churn_labels.astype(np.float32)
+        
+        # Convert string labels to integers
+        segment_to_idx = {seg: idx for idx, seg in enumerate(SEGMENT_CLASSES)}
+        self.y = np.array([segment_to_idx[s] for s in segment_labels], dtype=np.int64)
         
     def __len__(self):
         return len(self.X)
@@ -66,12 +90,12 @@ class ResidualBlock(nn.Module):
         return self.block(x) + x
 
 
-class ChurnPredictor(nn.Module):
+class SegmentPredictor(nn.Module):
     """
-    Churn Prediction Model with Monad-EMDE Backbone.
+    Segment Prediction Model with Monad-EMDE Backbone.
     
     Architecture:
-        L2-Norm Input → Monad-EMDE Backbone → Classification Head → Logits
+        L2-Norm Input → Monad-EMDE Backbone → Classification Head → 4-class Logits
     """
     
     def __init__(self, foundation_model_path: str, freeze_backbone: bool = False):
@@ -145,7 +169,7 @@ class ChurnPredictor(nn.Module):
         else:
             print("✓ Backbone unfrozen (full fine-tuning)")
         
-        # Classification head
+        # Classification head for 4-class segment prediction
         self.classifier = nn.Sequential(
             nn.Linear(output_dim, 256),
             nn.BatchNorm1d(256),
@@ -155,7 +179,7 @@ class ChurnPredictor(nn.Module):
             nn.BatchNorm1d(64),
             nn.LeakyReLU(negative_slope=LEAKY_RELU_SLOPE),
             nn.Dropout(0.2),
-            nn.Linear(64, 1)
+            nn.Linear(64, NUM_CLASSES)  # 4 classes
         )
         
     def forward(self, x):
@@ -170,48 +194,63 @@ class ChurnPredictor(nn.Module):
         
         # Classification head
         logits = self.classifier(features)
-        return logits.squeeze(-1)
+        return logits
 
 
 def load_data(walk: int = 4):
-    """Load EMDE session sketches and churn labels."""
+    """Load EMDE session sketches and segment labels."""
     filepath = os.path.join(DATA_DIR, f"emde_session_sketches_walk{walk}.npz")
     data = np.load(filepath, allow_pickle=True)
     
     past_sketches = data["past_sketches"]
     portfolio_sketches = data["portfolio_sketches"]
-    churn_labels = data["churn_labels"]
+    segments = data["segments"]
     
     print(f"✓ Loaded walk{walk} data:")
     print(f"  Past UBR: {past_sketches.shape}")
     print(f"  Portfolio: {portfolio_sketches.shape}")
-    print(f"  Churn labels: {churn_labels.shape}")
-    print(f"  Churn rate: {churn_labels.mean()*100:.2f}%")
+    print(f"  Segments: {segments.shape}")
     
-    return past_sketches, portfolio_sketches, churn_labels
+    # Print segment distribution
+    unique, counts = np.unique(segments, return_counts=True)
+    print(f"  Segment distribution:")
+    for seg, count in zip(unique, counts):
+        print(f"    {seg}: {count} ({count/len(segments)*100:.1f}%)")
+    
+    return past_sketches, portfolio_sketches, segments
+
+
+def compute_class_weights(labels):
+    """Compute class weights for imbalanced dataset."""
+    classes, counts = np.unique(labels, return_counts=True)
+    total = len(labels)
+    
+    # Inverse frequency weighting
+    weights = total / (len(classes) * counts)
+    
+    # Create weight tensor in class order
+    weight_dict = {cls: w for cls, w in zip(classes, weights)}
+    class_weights = torch.tensor([weight_dict[i] for i in range(NUM_CLASSES)], dtype=torch.float32)
+    
+    return class_weights
 
 
 def train_model(model, train_loader, val_loader, epochs, patience, device):
-    """Train with weighted BCEWithLogitsLoss."""
+    """Train with weighted CrossEntropyLoss."""
     
-    # Calculate class weights
+    # Calculate class weights from training data
     all_labels = []
     for _, y_batch in train_loader:
         all_labels.extend(y_batch.numpy())
-    
     all_labels = np.array(all_labels)
-    n_total = len(all_labels)
-    n_positive = all_labels.sum()
-    n_negative = n_total - n_positive
     
-    pos_weight = torch.tensor([n_negative / n_positive], device=device)
+    class_weights = compute_class_weights(all_labels).to(device)
     
-    print(f"\n✓ Class distribution:")
-    print(f"  Negative (retained): {int(n_negative)} ({n_negative/n_total*100:.1f}%)")
-    print(f"  Positive (churned):  {int(n_positive)} ({n_positive/n_total*100:.1f}%)")
-    print(f"  Positive weight: {pos_weight.item():.2f}")
+    print(f"\n✓ Class weights for imbalanced training:")
+    for i, seg in enumerate(SEGMENT_CLASSES):
+        print(f"  {seg}: {class_weights[i].item():.3f}")
     
-    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+    criterion = nn.CrossEntropyLoss(weight=class_weights)
     
     # Different LR for backbone and classifier
     if model.freeze_backbone:
@@ -231,10 +270,10 @@ def train_model(model, train_loader, val_loader, epochs, patience, device):
     best_model_state = None
     patience_counter = 0
     
-    train_losses, val_losses, val_aucs = [], [], []
+    train_losses, val_losses, val_accs, val_f1s = [], [], [], []
     
     print(f"\n{'='*60}")
-    print("FINE-TUNING FOR CHURN PREDICTION")
+    print("FINE-TUNING FOR SEGMENT PREDICTION")
     print(f"{'='*60}")
     
     for epoch in range(epochs):
@@ -272,15 +311,17 @@ def train_model(model, train_loader, val_loader, epochs, patience, device):
                 loss = criterion(logits, y_batch)
                 val_loss += loss.item() * X_batch.size(0)
                 
-                pred_probs = torch.sigmoid(logits)
-                all_preds.extend(pred_probs.cpu().numpy())
+                pred_classes = torch.argmax(logits, dim=-1)
+                all_preds.extend(pred_classes.cpu().numpy())
                 all_labels.extend(y_batch.cpu().numpy())
         
         val_loss /= len(val_loader.dataset)
         val_losses.append(val_loss)
         
-        val_auc = roc_auc_score(all_labels, all_preds)
-        val_aucs.append(val_auc)
+        val_acc = accuracy_score(all_labels, all_preds)
+        val_f1 = f1_score(all_labels, all_preds, average='macro')
+        val_accs.append(val_acc)
+        val_f1s.append(val_f1)
         
         scheduler.step(val_loss)
         
@@ -296,8 +337,8 @@ def train_model(model, train_loader, val_loader, epochs, patience, device):
             print(f"Epoch {epoch+1:3d}/{epochs} | "
                   f"Train Loss: {train_loss:.4f} | "
                   f"Val Loss: {val_loss:.4f} | "
-                  f"Val AUC: {val_auc:.4f} | "
-                  f"LR: {lr:.2e} | "
+                  f"Val Acc: {val_acc:.4f} | "
+                  f"Val F1: {val_f1:.4f} | "
                   f"Patience: {patience_counter}/{patience}")
         
         if patience_counter >= patience:
@@ -306,61 +347,77 @@ def train_model(model, train_loader, val_loader, epochs, patience, device):
     
     model.load_state_dict(best_model_state)
     print(f"✓ Best validation loss: {best_val_loss:.4f}")
-    print(f"✓ Best validation AUC: {max(val_aucs):.4f}")
+    print(f"✓ Best validation F1: {max(val_f1s):.4f}")
     
-    return train_losses, val_losses, val_aucs
+    return train_losses, val_losses, val_accs, val_f1s
 
 
 def evaluate_model(model, test_loader, device):
-    """Evaluate churn prediction model."""
+    """Evaluate segment prediction model."""
     model.eval()
-    all_preds, all_labels = [], []
+    all_preds, all_probs, all_labels = [], [], []
     
     with torch.no_grad():
         for X_batch, y_batch in test_loader:
             X_batch = X_batch.to(device)
             logits = model(X_batch)
-            pred_probs = torch.sigmoid(logits)
-            all_preds.extend(pred_probs.cpu().numpy())
+            probs = F.softmax(logits, dim=-1)
+            pred_classes = torch.argmax(logits, dim=-1)
+            
+            all_probs.extend(probs.cpu().numpy())
+            all_preds.extend(pred_classes.cpu().numpy())
             all_labels.extend(y_batch.cpu().numpy())
     
     preds = np.array(all_preds)
+    probs = np.array(all_probs)
     labels = np.array(all_labels)
     
-    binary_preds = (preds >= 0.5).astype(int)
+    # Metrics
+    accuracy = accuracy_score(labels, preds)
+    precision_macro = precision_score(labels, preds, average='macro', zero_division=0)
+    recall_macro = recall_score(labels, preds, average='macro', zero_division=0)
+    f1_macro = f1_score(labels, preds, average='macro', zero_division=0)
+    f1_weighted = f1_score(labels, preds, average='weighted', zero_division=0)
     
-    accuracy = accuracy_score(labels, binary_preds)
-    precision = precision_score(labels, binary_preds, zero_division=0)
-    recall = recall_score(labels, binary_preds, zero_division=0)
-    f1 = f1_score(labels, binary_preds, zero_division=0)
-    auc = roc_auc_score(labels, preds)
+    # Multi-class AUC (One-vs-Rest)
+    labels_binary = label_binarize(labels, classes=list(range(NUM_CLASSES)))
+    try:
+        auc_ovr = roc_auc_score(labels_binary, probs, multi_class='ovr', average='macro')
+    except ValueError:
+        auc_ovr = 0.0
     
     print(f"\n{'='*60}")
     print("EVALUATION RESULTS")
     print(f"{'='*60}")
-    print(f"Accuracy:  {accuracy:.4f}")
-    print(f"Precision: {precision:.4f}")
-    print(f"Recall:    {recall:.4f}")
-    print(f"F1 Score:  {f1:.4f}")
-    print(f"ROC-AUC:   {auc:.4f}")
+    print(f"Accuracy:        {accuracy:.4f}")
+    print(f"Precision (M):   {precision_macro:.4f}")
+    print(f"Recall (M):      {recall_macro:.4f}")
+    print(f"F1 Macro:        {f1_macro:.4f}")
+    print(f"F1 Weighted:     {f1_weighted:.4f}")
+    print(f"ROC-AUC (OvR):   {auc_ovr:.4f}")
     print(f"\nConfusion Matrix:")
-    print(confusion_matrix(labels, binary_preds))
+    print(confusion_matrix(labels, preds))
     print(f"\nClassification Report:")
-    print(classification_report(labels, binary_preds, target_names=['Retained', 'Churned'], zero_division=0))
+    print(classification_report(labels, preds, target_names=SEGMENT_CLASSES, zero_division=0))
     
-    return preds, labels, {'accuracy': accuracy, 'precision': precision, 'recall': recall, 'f1': f1, 'auc': auc}
+    metrics = {
+        'accuracy': accuracy,
+        'precision_macro': precision_macro,
+        'recall_macro': recall_macro,
+        'f1_macro': f1_macro,
+        'f1_weighted': f1_weighted,
+        'auc_ovr': auc_ovr
+    }
+    
+    return preds, probs, labels, metrics
 
 
-def plot_results(train_losses, val_losses, val_aucs, preds, labels, output_dir):
-    """Plot training curves and comprehensive evaluation results."""
+def plot_results(train_losses, val_losses, val_accs, val_f1s, preds, probs, labels, output_dir):
+    """Plot training curves and evaluation results."""
     os.makedirs(output_dir, exist_ok=True)
     
-    from sklearn.metrics import (
-        roc_curve, precision_recall_curve, average_precision_score,
-        confusion_matrix
-    )
-    from sklearn.calibration import calibration_curve
-    import seaborn as sns
+    from sklearn.metrics import roc_curve, auc
+    from sklearn.preprocessing import label_binarize
     
     # ==========================================================================
     # FIGURE 1: Training Metrics (2x2)
@@ -372,195 +429,94 @@ def plot_results(train_losses, val_losses, val_aucs, preds, labels, output_dir):
     ax.plot(train_losses, label='Train Loss', color='#3498db', linewidth=2)
     ax.plot(val_losses, label='Val Loss', color='#e74c3c', linewidth=2)
     ax.set_xlabel('Epoch')
-    ax.set_ylabel('BCE Loss')
+    ax.set_ylabel('CrossEntropy Loss')
     ax.set_title('Training & Validation Loss')
     ax.legend()
     ax.grid(True, alpha=0.3)
     
-    # 2. Validation AUC over epochs
+    # 2. Validation Accuracy & F1
     ax = axes[0, 1]
-    ax.plot(val_aucs, color='#2ecc71', linewidth=2)
-    ax.axhline(max(val_aucs), color='#e74c3c', linestyle='--', linewidth=1, label=f'Best: {max(val_aucs):.4f}')
+    ax.plot(val_accs, label='Val Accuracy', color='#2ecc71', linewidth=2)
+    ax.plot(val_f1s, label='Val F1 (Macro)', color='#9b59b6', linewidth=2)
+    ax.axhline(max(val_f1s), color='#e74c3c', linestyle='--', linewidth=1, label=f'Best F1: {max(val_f1s):.4f}')
     ax.set_xlabel('Epoch')
-    ax.set_ylabel('ROC-AUC')
-    ax.set_title('Validation AUC')
+    ax.set_ylabel('Score')
+    ax.set_title('Validation Accuracy & F1')
     ax.legend()
     ax.grid(True, alpha=0.3)
     
-    # 3. Prediction Distribution
+    # 3. Confusion Matrix
     ax = axes[1, 0]
-    ax.hist(preds[labels == 0], bins=50, alpha=0.7, label='Retained', color='#2ecc71', edgecolor='white')
-    ax.hist(preds[labels == 1], bins=50, alpha=0.7, label='Churned', color='#e74c3c', edgecolor='white')
-    ax.axvline(0.5, color='black', linestyle='--', linewidth=2, label='Threshold')
-    ax.set_xlabel('Predicted Churn Probability')
-    ax.set_ylabel('Count')
-    ax.set_title('Prediction Distribution by True Label')
-    ax.legend()
-    ax.grid(True, alpha=0.3)
+    cm = confusion_matrix(labels, preds)
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', ax=ax,
+                xticklabels=SEGMENT_CLASSES, 
+                yticklabels=SEGMENT_CLASSES,
+                annot_kws={'size': 12})
+    ax.set_xlabel('Predicted')
+    ax.set_ylabel('Actual')
+    ax.set_title('Confusion Matrix')
     
-    # 4. ROC Curve
+    # 4. Per-class Distribution
     ax = axes[1, 1]
-    fpr, tpr, _ = roc_curve(labels, preds)
-    auc = roc_auc_score(labels, preds)
-    ax.plot(fpr, tpr, color='#9b59b6', linewidth=2, label=f'ROC (AUC={auc:.4f})')
-    ax.plot([0, 1], [0, 1], 'k--', linewidth=1, label='Random')
-    ax.set_xlabel('False Positive Rate')
-    ax.set_ylabel('True Positive Rate')
-    ax.set_title('ROC Curve')
+    segment_colors = {'mass': '#3498db', 'affluent': '#2ecc71', 'private': '#9b59b6', 'business': '#e67e22'}
+    
+    for i, seg in enumerate(SEGMENT_CLASSES):
+        mask = labels == i
+        if mask.sum() > 0:
+            ax.hist(probs[mask, i], bins=30, alpha=0.5, label=f'{seg}', 
+                   color=segment_colors[seg], edgecolor='white')
+    ax.set_xlabel('Predicted Probability')
+    ax.set_ylabel('Count')
+    ax.set_title('Predicted Probability Distribution by True Class')
     ax.legend()
     ax.grid(True, alpha=0.3)
     
     plt.tight_layout()
-    filepath1 = os.path.join(output_dir, 'churn_prediction_results.png')
+    filepath1 = os.path.join(output_dir, 'segment_prediction_results.png')
     plt.savefig(filepath1, dpi=150, bbox_inches='tight', facecolor='white')
     plt.close()
     print(f"✓ Saved results plot to {filepath1}")
     
     # ==========================================================================
-    # FIGURE 2: Advanced KPIs (2x3)
+    # FIGURE 2: Multi-class ROC Curves (2x2)
     # ==========================================================================
-    fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+    fig, axes = plt.subplots(2, 2, figsize=(12, 10))
     
-    # 1. Precision-Recall Curve
-    ax = axes[0, 0]
-    precision, recall, pr_thresholds = precision_recall_curve(labels, preds)
-    avg_precision = average_precision_score(labels, preds)
-    ax.plot(recall, precision, color='#e67e22', linewidth=2, label=f'AP={avg_precision:.4f}')
-    ax.axhline(labels.mean(), color='gray', linestyle='--', label=f'Baseline: {labels.mean():.3f}')
-    ax.set_xlabel('Recall')
-    ax.set_ylabel('Precision')
-    ax.set_title('Precision-Recall Curve')
-    ax.legend()
-    ax.grid(True, alpha=0.3)
+    labels_binary = label_binarize(labels, classes=list(range(NUM_CLASSES)))
+    colors = ['#3498db', '#2ecc71', '#e67e22', '#9b59b6']
     
-    # 2. Confusion Matrix Heatmap
-    ax = axes[0, 1]
-    binary_preds = (preds >= 0.5).astype(int)
-    cm = confusion_matrix(labels, binary_preds)
-    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', ax=ax,
-                xticklabels=['Retained', 'Churned'], 
-                yticklabels=['Retained', 'Churned'],
-                annot_kws={'size': 14})
-    ax.set_xlabel('Predicted')
-    ax.set_ylabel('Actual')
-    ax.set_title('Confusion Matrix (Threshold=0.5)')
-    
-    # 3. Calibration Plot
-    ax = axes[0, 2]
-    try:
-        prob_true, prob_pred = calibration_curve(labels, preds, n_bins=10, strategy='uniform')
-        ax.plot(prob_pred, prob_true, 's-', color='#3498db', linewidth=2, markersize=8, label='Model')
-        ax.plot([0, 1], [0, 1], 'k--', linewidth=1, label='Perfect Calibration')
-        ax.set_xlabel('Mean Predicted Probability')
-        ax.set_ylabel('Fraction of Positives')
-        ax.set_title('Calibration Plot')
-        ax.legend()
+    for i, (seg, color) in enumerate(zip(SEGMENT_CLASSES, colors)):
+        ax = axes[i // 2, i % 2]
+        
+        fpr, tpr, _ = roc_curve(labels_binary[:, i], probs[:, i])
+        roc_auc = auc(fpr, tpr)
+        
+        ax.plot(fpr, tpr, color=color, linewidth=2, label=f'ROC (AUC={roc_auc:.4f})')
+        ax.plot([0, 1], [0, 1], 'k--', linewidth=1, label='Random')
+        ax.set_xlabel('False Positive Rate')
+        ax.set_ylabel('True Positive Rate')
+        ax.set_title(f'ROC Curve: {seg.capitalize()}')
+        ax.legend(loc='lower right')
         ax.grid(True, alpha=0.3)
-    except Exception as e:
-        ax.text(0.5, 0.5, f'Calibration Error:\n{str(e)[:50]}', ha='center', va='center')
-        ax.set_title('Calibration Plot (Error)')
-    
-    # 4. Metrics vs Threshold
-    ax = axes[1, 0]
-    thresholds = np.linspace(0.01, 0.99, 50)
-    precisions, recalls, f1s = [], [], []
-    for t in thresholds:
-        pred_t = (preds >= t).astype(int)
-        precisions.append(precision_score(labels, pred_t, zero_division=0))
-        recalls.append(recall_score(labels, pred_t, zero_division=0))
-        f1s.append(f1_score(labels, pred_t, zero_division=0))
-    
-    ax.plot(thresholds, precisions, label='Precision', color='#3498db', linewidth=2)
-    ax.plot(thresholds, recalls, label='Recall', color='#e74c3c', linewidth=2)
-    ax.plot(thresholds, f1s, label='F1', color='#2ecc71', linewidth=2)
-    ax.axvline(0.5, color='gray', linestyle='--', alpha=0.5)
-    best_f1_idx = np.argmax(f1s)
-    ax.axvline(thresholds[best_f1_idx], color='#9b59b6', linestyle=':', linewidth=2, 
-               label=f'Best F1 @ {thresholds[best_f1_idx]:.2f}')
-    ax.set_xlabel('Threshold')
-    ax.set_ylabel('Score')
-    ax.set_title('Metrics vs Threshold')
-    ax.legend(loc='center left')
-    ax.grid(True, alpha=0.3)
-    
-    # 5. Lift Chart
-    ax = axes[1, 1]
-    n_samples = len(preds)
-    sorted_indices = np.argsort(preds)[::-1]
-    sorted_labels = labels[sorted_indices]
-    cumulative_churn = np.cumsum(sorted_labels)
-    total_churn = labels.sum()
-    
-    percentiles = np.arange(1, n_samples + 1) / n_samples * 100
-    cumulative_captured = cumulative_churn / total_churn * 100
-    random_baseline = percentiles
-    
-    ax.plot(percentiles, cumulative_captured, color='#9b59b6', linewidth=2, label='Model')
-    ax.plot(percentiles, random_baseline, 'k--', linewidth=1, label='Random')
-    ax.fill_between(percentiles, random_baseline, cumulative_captured, alpha=0.2, color='#9b59b6')
-    ax.set_xlabel('% of Customers Contacted (Sorted by Score)')
-    ax.set_ylabel('% of Churners Captured')
-    ax.set_title('Cumulative Gain (Lift) Chart')
-    ax.legend()
-    ax.grid(True, alpha=0.3)
-    
-    # Add key lift values
-    for pct in [10, 20, 30]:
-        idx = int(n_samples * pct / 100)
-        captured = cumulative_captured[idx-1]
-        ax.annotate(f'{captured:.1f}%', (pct, captured), textcoords='offset points', 
-                   xytext=(5, 5), fontsize=9, color='#9b59b6')
-    
-    # 6. Summary Metrics Table
-    ax = axes[1, 2]
-    ax.axis('off')
-    
-    # Calculate key metrics
-    binary_preds = (preds >= 0.5).astype(int)
-    metrics_data = [
-        ['ROC-AUC', f'{roc_auc_score(labels, preds):.4f}'],
-        ['Average Precision', f'{avg_precision:.4f}'],
-        ['Accuracy', f'{accuracy_score(labels, binary_preds):.4f}'],
-        ['Precision (Churn)', f'{precision_score(labels, binary_preds, zero_division=0):.4f}'],
-        ['Recall (Churn)', f'{recall_score(labels, binary_preds, zero_division=0):.4f}'],
-        ['F1 Score', f'{f1_score(labels, binary_preds, zero_division=0):.4f}'],
-        ['Best F1 Threshold', f'{thresholds[best_f1_idx]:.2f}'],
-        ['Best F1 Score', f'{f1s[best_f1_idx]:.4f}'],
-        ['Lift @ 10%', f'{cumulative_captured[int(n_samples*0.1)-1]/10:.2f}x'],
-        ['Lift @ 20%', f'{cumulative_captured[int(n_samples*0.2)-1]/20:.2f}x'],
-    ]
-    
-    table = ax.table(cellText=metrics_data, colLabels=['Metric', 'Value'],
-                     loc='center', cellLoc='left', colWidths=[0.6, 0.4])
-    table.auto_set_font_size(False)
-    table.set_fontsize(11)
-    table.scale(1.2, 1.8)
-    
-    # Color header
-    for i in range(2):
-        table[(0, i)].set_facecolor('#3498db')
-        table[(0, i)].set_text_props(color='white', fontweight='bold')
-    
-    ax.set_title('Summary Metrics', fontsize=12, fontweight='bold', pad=20)
     
     plt.tight_layout()
-    filepath2 = os.path.join(output_dir, 'churn_advanced_kpis.png')
+    filepath2 = os.path.join(output_dir, 'segment_roc_curves.png')
     plt.savefig(filepath2, dpi=150, bbox_inches='tight', facecolor='white')
     plt.close()
-    print(f"✓ Saved advanced KPIs plot to {filepath2}")
+    print(f"✓ Saved ROC curves to {filepath2}")
 
 
 def main():
     print("="*60)
-    print("CHURN PREDICTION WITH MONAD-EMDE FINE-TUNING")
+    print("SEGMENT PREDICTION WITH MONAD-EMDE FINE-TUNING")
     print("="*60)
     print()
     
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     
-    past, portfolio, churn_labels = load_data(WALK)
+    past, portfolio, segments = load_data(WALK)
     
-    dataset = ChurnDataset(past, portfolio, churn_labels)
+    dataset = SegmentDataset(past, portfolio, segments)
     
     n_samples = len(dataset)
     n_train = int(0.7 * n_samples)
@@ -583,10 +539,10 @@ def main():
     
     foundation_model_path = os.path.join(FOUNDATION_MODEL_DIR, f'future_ubr_model_walk{WALK}.pt')
     
-    print(f"\n✓ Creating churn predictor:")
+    print(f"\n✓ Creating segment predictor:")
     print(f"  Freeze backbone: {FREEZE_BACKBONE}")
     
-    model = ChurnPredictor(
+    model = SegmentPredictor(
         foundation_model_path=foundation_model_path,
         freeze_backbone=FREEZE_BACKBONE
     ).to(DEVICE)
@@ -596,30 +552,38 @@ def main():
     print(f"  Total params: {total_params:,}")
     print(f"  Trainable params: {trainable_params:,}")
     
-    train_losses, val_losses, val_aucs = train_model(
+    train_losses, val_losses, val_accs, val_f1s = train_model(
         model, train_loader, val_loader, EPOCHS, PATIENCE, DEVICE
     )
     
-    preds, labels, metrics = evaluate_model(model, test_loader, DEVICE)
+    preds, probs, labels, metrics = evaluate_model(model, test_loader, DEVICE)
     
-    plot_results(train_losses, val_losses, val_aucs, preds, labels, OUTPUT_DIR)
+    plot_results(train_losses, val_losses, val_accs, val_f1s, preds, probs, labels, OUTPUT_DIR)
     
-    model_path = os.path.join(OUTPUT_DIR, f'churn_predictor_walk{WALK}.pt')
+    model_path = os.path.join(OUTPUT_DIR, f'segment_predictor_walk{WALK}.pt')
     torch.save({
         'model_state_dict': model.state_dict(),
         'freeze_backbone': FREEZE_BACKBONE,
         'walk': WALK,
         'metrics': metrics,
-        'architecture': 'MonadEMDE_ChurnPredictor'
+        'segment_classes': SEGMENT_CLASSES,
+        'architecture': 'MonadEMDE_SegmentPredictor'
     }, model_path)
     print(f"✓ Saved model to {model_path}")
     
-    pred_path = os.path.join(OUTPUT_DIR, f'churn_predictions_walk{WALK}.npz')
-    np.savez_compressed(pred_path, predictions=preds, labels=labels, metrics=metrics)
+    pred_path = os.path.join(OUTPUT_DIR, f'segment_predictions_walk{WALK}.npz')
+    np.savez_compressed(
+        pred_path, 
+        predictions=preds, 
+        probabilities=probs,
+        labels=labels, 
+        metrics=metrics,
+        segment_classes=SEGMENT_CLASSES
+    )
     print(f"✓ Saved predictions to {pred_path}")
     
     print(f"\n{'='*60}")
-    print("CHURN PREDICTION COMPLETE!")
+    print("SEGMENT PREDICTION COMPLETE!")
     print(f"{'='*60}")
 
 

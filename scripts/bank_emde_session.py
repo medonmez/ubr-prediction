@@ -22,28 +22,33 @@ import matplotlib.pyplot as plt
 from sklearn.manifold import TSNE
 
 # Configuration
-WALK_OPTIONS = [1, 4]
+WALK_OPTIONS = [1, 2, 3, 4]
 EMBED_DIR = "../data/embeddings"
 OUTPUT_DIR = "../data/emde"
 
-# EMDE Configuration (Based on EMDE Literature)
+# EMDE Configuration (DLSH - Density-dependent LSH)
 # ================================================
-# N (Depth/Ensemble): Number of independent random subspaces
-# K (Width): Determines bucket count per subspace = 2^K
-# Final sketch dimension: N × 2^K
+# Uses DLSH (Density-dependent Locality Sensitive Hashing) for bucket assignment.
+# Unlike classic LSH which uses random bias, DLSH learns bucket boundaries
+# from the data distribution using quantile functions.
 #
-# Recommended for Churn Prediction:
-#   N = 32 (higher = more stability, less noise)
-#   K = 7  (2^7 = 128 buckets - balanced discriminative power)
-#   Result: 32 × 128 = 4,096 dimensional sketch
+# DLSH ADVANTAGES:
+#   1. No empty buckets: Boundaries are placed where data exists
+#   2. Dense regions get finer granularity
+#   3. Maximum memory efficiency in sketch vector
+#   4. Better similarity preservation for non-uniform data
 #
-# Note: Higher K (e.g., 10+) can break Cleora's metric prior
-#       (similar products should remain close in embedding space)
+# Configuration:
+#   N = 64 subspaces (more subspaces = more stable representation)
+#   B = 32 bins per subspace (quantile-based, guaranteed no empty bins)
+#   Result: 64 × 32 = 2,048 dimensional sketch
 #
-NUM_SUBSPACES = 32      # N: Number of random subspaces (depth/ensemble)
-SUBSPACE_DIM = 32       # Dimension of each random projection (for LSH)
-NUM_BINS = 128          # 2^K where K=7 (width parameter)
-# Final sketch_dim = NUM_SUBSPACES × NUM_BINS = 32 × 128 = 4,096
+# Note: DLSH requires fit() to learn quantile boundaries from data
+#
+NUM_SUBSPACES = 10      # N: Number of random projection subspaces
+NUM_BINS = 32           # B: Number of bins per subspace (quantile-based)
+# Final sketch_dim = NUM_SUBSPACES × NUM_BINS = 10 × 32 = 320
+L2_NORMALIZE = False    # Disabled: Cleora embeddings already L2-normalized, DLSH doesn't require it
 
 # Time Configuration
 PAST_DAYS = 25          # Days for Past UBR (input to model)
@@ -134,60 +139,119 @@ def compute_time_decay_weight(days_ago: float, lambda_decay: float = 0.02) -> fl
     return np.exp(-lambda_decay * days_ago)
 
 
-class EMDESketchGenerator:
+class DLSHSketchGenerator:
     """
-    EMDE (Efficient Manifold Density Estimator) with Time Decay.
+    EMDE with DLSH (Density-dependent Locality Sensitive Hashing).
     
-    Creates weighted sparse sketches:
-    1. Projects embeddings to multiple subspaces
-    2. Applies time-decay weights to each embedding
-    3. Creates weighted histogram per subspace
-    4. Concatenates into final sketch
+    DLSH uses quantile-based bucketing instead of random bias:
+    1. Project embeddings onto random vectors (r_i)
+    2. Learn bucket boundaries from data distribution using quantile function
+    3. Assign buckets based on learned quantile thresholds
+    
+    Key Benefits over Classic LSH:
+    - No empty buckets: boundaries are placed where data exists
+    - Better representation of dense regions
+    - Maximum memory efficiency in sketch vector
+    
+    Requires fit() before use - learns quantile boundaries from training data.
     """
     
     def __init__(
         self, 
         embed_dim: int,
-        num_subspaces: int = 32,
-        subspace_dim: int = 32,
-        num_bins: int = 16,
+        num_subspaces: int = 64,
+        num_bins: int = 32,  # Direct bin count (not 2^bits)
+        l2_normalize: bool = True,
         seed: int = 42
     ):
         self.embed_dim = embed_dim
         self.num_subspaces = num_subspaces
-        self.subspace_dim = subspace_dim
         self.num_bins = num_bins
+        self.l2_normalize = l2_normalize
         self.seed = seed
         self.sketch_dim = num_subspaces * num_bins
+        self.is_fitted = False
         
-        # Initialize random projections
+        # Initialize random projection vectors (one per subspace)
         np.random.seed(seed)
         self.projections = []
         for i in range(num_subspaces):
-            proj = SparseRandomProjection(
-                n_components=subspace_dim,
-                random_state=seed + i
-            )
-            proj.fit(np.zeros((1, embed_dim)))
-            self.projections.append(proj)
+            # Random projection vector: (embed_dim,)
+            r = np.random.randn(embed_dim)
+            r = r / np.linalg.norm(r)  # Normalize to unit vector
+            self.projections.append(r)
         
-        self.bin_edges = None
+        # Quantile boundaries will be learned during fit()
+        # Shape: (num_subspaces, num_bins - 1) - thresholds between bins
+        self.quantile_boundaries = None
         
+        print(f"  Initialized DLSH-EMDE: {num_subspaces} subspaces × {num_bins} bins = {self.sketch_dim} dim")
+        print(f"  Mode: Density-dependent (quantile-based bucketing)")
+        if l2_normalize:
+            print(f"  L2 normalization enabled")
+    
     def fit(self, embeddings: np.ndarray):
-        """Fit bin edges based on embedding distribution."""
-        print(f"  Fitting EMDE on {len(embeddings):,} embeddings...")
+        """
+        Learn quantile boundaries from training data.
         
-        self.bin_edges = []
-        for i, proj in enumerate(self.projections):
-            projected = proj.transform(embeddings)
-            subspace_edges = []
-            for d in range(self.subspace_dim):
-                percentiles = np.linspace(0, 100, self.num_bins + 1)
-                edges = np.percentile(projected[:, d], percentiles)
-                subspace_edges.append(edges)
-            self.bin_edges.append(subspace_edges)
+        For each subspace:
+        1. Project all embeddings onto the random vector
+        2. Compute quantile thresholds that divide data into equal-sized bins
         
-        print(f"  ✓ Fitted {self.num_subspaces} subspaces")
+        Args:
+            embeddings: (N, embed_dim) training embeddings to learn distribution from
+        """
+        if self.l2_normalize:
+            norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
+            norms = np.where(norms == 0, 1, norms)
+            embeddings = embeddings / norms
+        
+        # Quantile percentages for bin boundaries
+        # For num_bins=32, we need 31 boundaries at 1/32, 2/32, ..., 31/32
+        quantile_percentages = np.linspace(0, 1, self.num_bins + 1)[1:-1]  # Exclude 0 and 1
+        
+        self.quantile_boundaries = []
+        
+        for i in range(self.num_subspaces):
+            # Project all embeddings onto this subspace's random vector
+            # (N, embed_dim) @ (embed_dim,) = (N,)
+            projected = embeddings @ self.projections[i]
+            
+            # Compute quantile boundaries from the projection distribution
+            # These are the threshold values that divide data into equal-sized bins
+            boundaries = np.quantile(projected, quantile_percentages)
+            self.quantile_boundaries.append(boundaries)
+        
+        self.quantile_boundaries = np.array(self.quantile_boundaries)  # (num_subspaces, num_bins-1)
+        self.is_fitted = True
+        
+        print(f"  ✓ DLSH fitted on {len(embeddings):,} embeddings")
+        print(f"    Learned {self.num_bins - 1} quantile boundaries per subspace")
+    
+    def _compute_bucket(self, embeddings: np.ndarray, subspace_idx: int) -> np.ndarray:
+        """
+        Compute bucket indices using learned quantile boundaries.
+        
+        Args:
+            embeddings: (N, embed_dim) array
+            subspace_idx: Which subspace to use
+            
+        Returns:
+            (N,) array of bucket indices [0, num_bins-1]
+        """
+        if not self.is_fitted:
+            raise RuntimeError("DLSH must be fitted before use. Call fit() first.")
+        
+        # Project embeddings onto the random vector
+        projected = embeddings @ self.projections[subspace_idx]  # (N,)
+        
+        # Use searchsorted to find bucket indices based on quantile boundaries
+        # searchsorted returns the index where each projected value would be inserted
+        # to maintain sorted order, which corresponds to the bucket index
+        boundaries = self.quantile_boundaries[subspace_idx]  # (num_bins-1,)
+        bucket_indices = np.searchsorted(boundaries, projected)  # (N,)
+        
+        return bucket_indices
         
     def create_weighted_sketch(
         self, 
@@ -195,7 +259,12 @@ class EMDESketchGenerator:
         weights: np.ndarray
     ) -> np.ndarray:
         """
-        Create time-decay weighted EMDE sketch.
+        Create time-decay weighted EMDE sketch using DLSH.
+        
+        DLSH Advantages:
+        - Quantile-based boundaries ensure no empty buckets
+        - Dense regions get finer granularity
+        - Sparse regions are grouped efficiently
         
         Args:
             embeddings: (N, embed_dim) array of embeddings
@@ -207,27 +276,33 @@ class EMDESketchGenerator:
         if len(embeddings) == 0:
             return np.zeros(self.sketch_dim)
         
+        # L2 Normalize embeddings
+        if self.l2_normalize:
+            norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
+            norms = np.where(norms == 0, 1, norms)
+            embeddings = embeddings / norms
+        
         sketch = np.zeros(self.sketch_dim)
         
-        for i, proj in enumerate(self.projections):
-            projected = proj.transform(embeddings)
+        for i in range(self.num_subspaces):
+            # Get bucket indices using DLSH (quantile-based)
+            bucket_indices = self._compute_bucket(embeddings, i)
             
-            for d in range(min(self.subspace_dim, projected.shape[1])):
-                edges = self.bin_edges[i][d]
-                bin_indices = np.digitize(projected[:, d], edges[1:-1])
-                bin_indices = np.clip(bin_indices, 0, self.num_bins - 1)
-                
-                # Weighted count
-                for j, b in enumerate(bin_indices):
-                    sketch_idx = i * self.num_bins + b
-                    sketch[sketch_idx] += weights[j]
+            # Add weighted counts to sketch
+            for j, bucket in enumerate(bucket_indices):
+                sketch_idx = i * self.num_bins + bucket
+                sketch[sketch_idx] += weights[j]
         
-        # Normalize
+        # L1 Normalize
         total_weight = weights.sum()
         if total_weight > 0:
             sketch = sketch / total_weight
         
         return sketch
+
+
+# Keep the old class as an alias for backward compatibility
+EMDESketchGenerator = DLSHSketchGenerator
 
 
 def create_customer_session_sketches(
@@ -497,19 +572,18 @@ def main():
             str(eid): emb for eid, emb in zip(entity_ids, embeddings)
         }
         
-        # Initialize EMDE
-        print(f"\n[1/3] Initializing EMDE...")
-        emde = EMDESketchGenerator(
+        # Initialize DLSH-EMDE (requires fit)
+        print(f"\n[1/3] Initializing DLSH-EMDE...")
+        emde = DLSHSketchGenerator(
             embed_dim=embeddings.shape[1],
             num_subspaces=NUM_SUBSPACES,
-            subspace_dim=SUBSPACE_DIM,
             num_bins=NUM_BINS,
+            l2_normalize=L2_NORMALIZE,
             seed=SEED
         )
-        print(f"  Sketch dimension: {emde.sketch_dim}")
         
-        # Fit on product/event embeddings
-        print(f"\n[2/3] Fitting EMDE on product/event embeddings...")
+        # Fit DLSH on product/event embeddings to learn quantile boundaries
+        print(f"\n[2/3] Fitting DLSH on embedding distribution...")
         emde.fit(embeddings)
         
         # Create session sketches

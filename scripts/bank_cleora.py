@@ -16,7 +16,7 @@ import matplotlib.pyplot as plt
 
 # Configuration
 EMBED_DIM = 1024
-WALK_OPTIONS = [1, 4]  # Generate embeddings for both walk counts
+WALK_OPTIONS = [1, 2, 3, 4]  # Generate embeddings for all walk counts
 INPUT_FILE = "../data/cleora_hyperedges.txt"
 OUTPUT_DIR = "../data/embeddings"
 

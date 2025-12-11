@@ -29,11 +29,11 @@ from sklearn.metrics.pairwise import cosine_similarity
 # Configuration
 DATA_DIR = "../data/emde"
 OUTPUT_DIR = "../data/ffn_model"
-WALK = 4
+WALK = 4  # Using walk4 with DLSH
 
 # Model Configuration (Monad-EMDE Paper Specifications)
-# Input: Past UBR (4096) + Portfolio (4096) = 8192
-# Output: Future UBR (4096)
+# Input: Past UBR + Portfolio (dimensions read from data)
+# Output: Future UBR (dimension read from data)
 HIDDEN_DIM = 3000        # ~3000 neurons per hidden layer (paper recommendation)
 NUM_HIDDEN_LAYERS = 3    # 3 hidden layers with residual connections
 DROPOUT = 0.1            # Light dropout for regularization

@@ -6,7 +6,7 @@ Banka müşterilerinin churn (kayıp) olasılığını tahmin eden uçtan uca (e
 
 ```
 churn-test/
-├── README.md             
+├── README.md              
 ├── requirements.txt       # Python bağımlılıkları
 ├── scripts/               # Tüm Python scriptleri
 │   ├── generate_bank_data.py      # 1. Sentetik veri üretimi
@@ -54,7 +54,7 @@ python generate_bank_data.py
 # Adım 2: Graph embeddings oluştur (~2 dk)
 python bank_cleora.py
 
-# Adım 3: EMDE sketches oluştur (~3 dk)
+# Adım 3: EMDE sketches oluştur (~5 dk)
 python bank_emde_session.py
 
 # Adım 4: Foundation model eğit (~2 dk)
@@ -82,10 +82,9 @@ python churn_prediction_finetune.py
 
 Pipeline tamamlandığında `data/churn_model/` içinde:
 - `churn_prediction_results.png`: Temel metrikler
-- `churn_advanced_kpis.png`: Detaylı KPI'lar (Lift, PR Curve, Calibration)
+- `churn_advanced_kpis.png`: KPI'lar (Lift, PR Curve, Calibration)
 - `churn_predictor_walk4.pt`: Eğitilmiş model
 
-Beklenen performans: **ROC-AUC > 0.99**, **Recall > 0.95**
 
 ---
 
