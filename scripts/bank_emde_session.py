@@ -69,7 +69,7 @@ TOTAL_DAYS = 30
 # Other options:
 #   alpha = 0.99 → lambda ≈ 0.0101 (very gentle, almost no decay)
 #   alpha = 0.95 → lambda ≈ 0.0513 (moderate decay)
-#   alpha = 0.90 → lambda ≈ 0.1054 (aggressive decay - old default)
+#   alpha = 0.90 → lambda ≈ 0.1054 (aggressive decay)
 #
 TIME_DECAY_LAMBDA = 0.02  # Corresponds to alpha ≈ 0.98 (RECOMMENDED)
 
